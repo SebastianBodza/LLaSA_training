@@ -149,17 +149,17 @@ if __name__ == "__main__":
                         help='Path to the model checkpoint')
     parser.add_argument('--output-dir', type=str, default='/path/to/saving_code_folder',
                         help='Output directory for saving tokenized sequences')
-    parser.add_argument('--batch_size', type=int, default=6, help='Batch size for processing')
+    parser.add_argument('--batch_size', type=int, default=12, help='Batch size for processing')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of worker threads for the DataLoader')
     parser.add_argument('--max_length', type=int, default=4096, help='Max sequence length')
     args = parser.parse_args()
 
     # Initialize distributed backend and set device based on local rank.
-    init_distributed()
-    local_rank = args.local_rank
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    
+    init_distributed()
+
     target_sr = 16000
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -255,7 +255,7 @@ if __name__ == "__main__":
         print(f"\nProcessing split: {split}")
         ds_split = ds[split]
         # (Optional) For debugging you might want to limit the number of examples:
-        # ds_split = ds_split.select(list(range(32)))
+        # ds_split = ds_split.select(list(range(int(len(ds_split)*0.5))))
         dataset = WaveDataset(ds_split, target_sampling_rate=target_sr)
         sampler = DistributedSampler(dataset, shuffle=False)
         dataloader = DataLoader(
