@@ -120,25 +120,21 @@ def init_distributed():
     from torch.distributed import init_process_group
     init_process_group(backend="nccl")
 
-# Utility for gathering objects across processes.
+# Utility for gathering objects across processes using a Gloo group.
 def gather_results(result_list):
     """
     Gather a list of Python objects from all processes using a temporary Gloo process group.
     Returns a flattened list containing results from all processes.
     """
     world_size = dist.get_world_size()
-    # Create a new process group using Gloo (on CPU)
+    # Create a Gloo process group for gathering objects.
     gloo_group = dist.new_group(backend="gloo")
     all_results = [None for _ in range(world_size)]
     dist.all_gather_object(all_results, result_list, group=gloo_group)
-    # Flatten the list:
     combined = []
     for sublist in all_results:
         combined.extend(sublist)
     return combined
-
-
-
 
 ####################
 # Main Processing  #
@@ -155,15 +151,15 @@ if __name__ == "__main__":
                         help='Output directory for saving tokenized sequences')
     parser.add_argument('--batch_size', type=int, default=6, help='Batch size for processing')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of worker threads for the DataLoader')
-    # Processing parameters:
     parser.add_argument('--max_length', type=int, default=4096, help='Max sequence length')
     args = parser.parse_args()
-    # Initialize distributed backend
+
+    # Initialize distributed backend and set device based on local rank.
     init_distributed()
     local_rank = args.local_rank
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-
-
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    
     target_sr = 16000
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -250,17 +246,16 @@ if __name__ == "__main__":
     # Set the pad token id (adjust according to your tokenizer/model)
     tokenizer.pad_token_id = 128001
 
-    #########################
-    # Load & Subset Dataset #
-    #########################
+    ######################
+    # Process All Splits #
+    ######################
     print(f"Loading dataset from {args.dataset_dir}")
     ds = load_from_disk(args.dataset_dir)
-    # Prefer the "test" split if it exists; otherwise use the entire dataset.
     for split in ds.keys():
         print(f"\nProcessing split: {split}")
         ds_split = ds[split]
-
-
+        # (Optional) For debugging you might want to limit the number of examples:
+        # ds_split = ds_split.select(list(range(32)))
         dataset = WaveDataset(ds_split, target_sampling_rate=target_sr)
         sampler = DistributedSampler(dataset, shuffle=False)
         dataloader = DataLoader(
@@ -272,66 +267,57 @@ if __name__ == "__main__":
             sampler=sampler,
             collate_fn=pad_audio_batch,
         )
-
-        #####################
-        # Processing & Save #
-        #####################
+    
         max_length = args.max_length
-        all_final_sequences = []  # List to accumulate tokenized sequences
-
+        all_final_sequences = []  # List to accumulate tokenized sequences for this split
+    
         print("Processing batches ...")
         st = time()
-        for batch in tqdm(dataloader, desc="processing"):
+        for batch in tqdm(dataloader, desc=f"Processing split {split}"):
             wavs, feats, wav_paths, lengths, texts = batch
             wavs = wavs.to(device)
             
             with torch.no_grad():
                 # 1) Codec encoder to get speech representation
-                vq_emb = encoder(wavs)  # e.g., [batch, time//down, 1024]
+                vq_emb = encoder(wavs)  # [batch, time//down, 1024]
                 vq_emb = vq_emb.transpose(1, 2)  # [batch, 1024, frames]
-
+    
                 # 2) Semantic processing
                 semantic_target = semantic_model(feats[:, 0, :, :].to(device))
                 semantic_target = semantic_target.hidden_states[16]
                 semantic_target = semantic_target.transpose(1, 2)
                 semantic_target = SemanticEncoder_module(semantic_target)
-
+    
                 # 3) Concatenate and process with fc_prior
                 vq_emb = torch.cat([semantic_target, vq_emb], dim=1)
                 vq_emb = fc_prior(vq_emb.transpose(1, 2)).transpose(1, 2)
-
+    
                 # 4) Pass through decoder quantization part to get final speech tokens
                 _, vq_code, _ = decoder(vq_emb, vq=True)
-                # vq_code shape: [batch, frames]
-
-            # For each sample in the batch, convert the speech codes into token IDs
-            # and combine these with the tokenized text.
+                # Expected vq_code shape: [batch, 1, frames]
+    
             batch_size = vq_code.size(0)
             for i in range(batch_size):
-                # Process text: add understanding start/end markers
                 text = texts[i]
                 text_input = f"<|TEXT_UNDERSTANDING_START|>{text}<|TEXT_UNDERSTANDING_END|>"
                 text_ids = tokenizer.encode(text_input, add_special_tokens=False)
                 
-                # Process speech: convert each code into a token.
-                # Note: You can adjust the conversion as needed.
-                speech_codes = vq_code[i, 0, : lengths[i]]   # Now speech_codes is 1D
-                speech_ids = ([tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")]
-                            + [tokenizer.convert_tokens_to_ids(f"<|s_{int(code.item())}|>")
-                                for code in speech_codes.cpu()]
-                            + [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")])
+                # Remove extra channel; now speech_codes is 1D.
+                speech_codes = vq_code[i, 0, : lengths[i]]
+                speech_ids = (
+                    [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")]
+                    + [tokenizer.convert_tokens_to_ids(f"<|s_{int(code.item())}|>")
+                       for code in speech_codes.cpu()]
+                    + [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")]
+                )
                 
-                # Determine space available for text tokens.
                 MAX_TEXT_SPACE = max_length - len(speech_ids)
                 if MAX_TEXT_SPACE < 0:
-                    # Skip samples that produce too many speech codes.
                     continue
                 truncated_text = text_ids[:MAX_TEXT_SPACE]
-                
                 final_sequence = (truncated_text + speech_ids +
-                                [tokenizer.pad_token_id] * (max_length - len(truncated_text) - len(speech_ids)))
+                                  [tokenizer.pad_token_id] * (max_length - len(truncated_text) - len(speech_ids)))
                 final_sequence = final_sequence[:max_length]
-                
                 all_final_sequences.append(final_sequence)
         et = time()
         print(f"Processing split '{split}' completed in {(et - st) / 60:.2f} mins")
@@ -345,3 +331,4 @@ if __name__ == "__main__":
             print(f"Saving tokenized sequences for split '{split}' to memmap...")
             save_tokenized_memmap(all_final_sequences, args.output_dir, split, max_length)
 
+# HF_HOME="/media/bodza/Audio_Dataset/hf_cache/" torchrun --nproc_per_node=2 original_translate_to_dataset_o3.py --dataset-dir="/media/bodza/Audio_Dataset/podcast_dataset/" --ckpt="/media/bodza/Audio_Dataset/xcodec_raw_files/xcodec2/ckpt/epoch=4-step=1400000.ckpt" --output-dir="/media/bodza/Audio_Dataset/xcodec_raw_files/output_original"
