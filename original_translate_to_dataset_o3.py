@@ -273,6 +273,8 @@ if __name__ == "__main__":
     tokenizer.add_tokens(all_new_tokens)
     # Set the pad token id (adjust according to your tokenizer/model)
     tokenizer.pad_token_id = 128001
+    SPEECH_GEN_START_ID = tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")
+    SPEECH_GEN_END_ID = tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
 
     ######################
     # Process All Splits #
@@ -319,6 +321,7 @@ if __name__ == "__main__":
         st = time()
         with torch.inference_mode(), torch.amp.autocast(device_type="cuda"):
             for batch in tqdm(dataloader, desc=f"Processing split {split}"):
+                model_start_time = time()
                 wavs, feats, wav_paths, lengths, texts = batch
                 wavs = wavs.to(device)
             
@@ -339,20 +342,28 @@ if __name__ == "__main__":
                 # 4) Pass through decoder quantization part to get final speech tokens
                 _, vq_code, _ = decoder(vq_emb, vq=True)
                 # Expected vq_code shape: [batch, 1, frames]
-    
+
                 batch_size = vq_code.size(0)
+                model_time = time() - model_start_time
+                tokenize_start_time = time()
+
+                text_inputs = [f"<|TEXT_UNDERSTANDING_START|>{text}<|TEXT_UNDERSTANDING_END|>" for text in texts]
+                batched_text_ids = tokenizer.batch_encode_plus(text_inputs, 
+                                                               add_special_tokens=False, 
+                                                               padding=False, 
+                                                               truncation=False
+                                                               )["input_ids"]
+                tokenization_sub_time = time() - tokenize_start_time
                 for i in range(batch_size):
-                    text = texts[i]
-                    text_input = f"<|TEXT_UNDERSTANDING_START|>{text}<|TEXT_UNDERSTANDING_END|>"
-                    text_ids = tokenizer.encode(text_input, add_special_tokens=False)
-                    
+                    text_ids = batched_text_ids[i]
                     # Remove extra channel; now speech_codes is 1D.
-                    speech_codes = vq_code[i, 0, : lengths[i]]
+                    speech_codes_tensor = vq_code[i, 0, : lengths[i]]
+                    speech_codes = speech_codes_tensor.cpu().tolist()
+                    speech_token_strs = [f"<|s_{int(code)}|>" for code in speech_codes]
                     speech_ids = (
-                        [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")]
-                        + [tokenizer.convert_tokens_to_ids(f"<|s_{int(code.item())}|>")
-                        for code in speech_codes.cpu()]
-                        + [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")]
+                        [SPEECH_GEN_START_ID]
+                        + [tokenizer.convert_tokens_to_ids(token) for token in speech_token_strs]
+                        + [SPEECH_GEN_END_ID]
                     )
                     
                     MAX_TEXT_SPACE = max_length - len(speech_ids)
@@ -363,6 +374,11 @@ if __name__ == "__main__":
                                     [tokenizer.pad_token_id] * (max_length - len(truncated_text) - len(speech_ids)))
                     final_sequence = final_sequence[:max_length]
                     all_final_sequences.append(final_sequence)
+                tokenize_time = time() - tokenize_start_time
+                print(f"Batch: model_time = {model_time * 1000:.2f} ms, "
+                    f"tokenize_time = {tokenize_time * 1000:.2f} ms")
+                print(f"Batch: tokenization_sub_time = {tokenization_sub_time * 1000:.2f} ms")
+
         et = time()
         print(f"Processing split '{split}' completed in {(et - st) / 60:.2f} mins")
     
