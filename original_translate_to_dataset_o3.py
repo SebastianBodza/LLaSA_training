@@ -22,7 +22,11 @@ import torch.distributed as dist
 # Utility Functions #
 #####################
 
-def pad_audio_batch(batch):
+def pad_audio_batch(batch, longest_audio):
+    """
+    Expects each element in batch as a tuple (audio, feat, fname, audio_length, text).
+    The longest_audio argument specifies the target length (in samples) for padding.
+    """
     audio_list, feat_list, fname_list, audio_length, texts = zip(*batch)
     feat_list = list(feat_list)
     
@@ -31,26 +35,31 @@ def pad_audio_batch(batch):
     padded_audios = []
  
     for audio in audio_list:
-        padding = max_length - audio.shape[1]
+        padding = longest_audio - audio.shape[1]
         if padding > 0:
             padded_audio = F.pad(audio, (0, padding), mode="constant", value=0)
         else:
-            padded_audio = audio[:, :max_length]
+            padded_audio = audio[:, :longest_audio]
         padded_audios.append(padded_audio)
     padded_audios = torch.stack(padded_audios)
     
+
+    longest_feat = longest_audio // 320
     padded_feat_list = []
     for feat in feat_list:
-        padding = max_length_feat - feat.shape[1]
+        padding = longest_feat - feat.shape[1]
         padded_feat = F.pad(feat, (0, 0, 0, padding), mode="constant", value=0)
         padded_feat_list.append(padded_feat)
     padded_feat_list = torch.stack(padded_feat_list)
     
     return padded_audios, padded_feat_list, fname_list, audio_length, texts
-
 ####################
 # Dataset Function #
 ####################
+def add_length(start, end):
+    # Calculate lengths using start and end columns
+    audio_len = np.array(end) - np.array(start)
+    return {"audio_len": audio_len}
 
 class WaveDataset(Dataset):
     """
@@ -149,7 +158,7 @@ if __name__ == "__main__":
                         help='Path to the model checkpoint')
     parser.add_argument('--output-dir', type=str, default='/path/to/saving_code_folder',
                         help='Output directory for saving tokenized sequences')
-    parser.add_argument('--batch_size', type=int, default=12, help='Batch size for processing')
+    parser.add_argument('--batch_size', type=int, default=24, help='Batch size for processing')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of worker threads for the DataLoader')
     parser.add_argument('--max_length', type=int, default=4096, help='Max sequence length')
     args = parser.parse_args()
@@ -223,6 +232,25 @@ if __name__ == "__main__":
     fc_post_a.to(device)
     fc_prior.to(device)
 
+    use_fp16 = False
+    if use_fp16:
+        semantic_model = semantic_model.half()
+        SemanticEncoder_module = SemanticEncoder_module.half()
+        encoder = encoder.half()
+        decoder = decoder.half()
+        fc_post_a = fc_post_a.half()
+        fc_prior = fc_prior.half()
+
+
+    # # Compile models using torch.compile for improved throughput.
+    semantic_model = torch.compile(semantic_model, mode="reduce-overhead")
+    SemanticEncoder_module = torch.compile(SemanticEncoder_module, mode="reduce-overhead")
+    encoder = torch.compile(encoder, mode="reduce-overhead")
+    decoder = torch.compile(decoder, mode="reduce-overhead")
+    fc_post_a = torch.compile(fc_post_a, mode="reduce-overhead")
+    fc_prior = torch.compile(fc_prior, mode="reduce-overhead")
+
+
     ############################
     # Load Tokenizer & Add Tokens
     ############################
@@ -254,8 +282,23 @@ if __name__ == "__main__":
     for split in ds.keys():
         print(f"\nProcessing split: {split}")
         ds_split = ds[split]
-        # (Optional) For debugging you might want to limit the number of examples:
-        # ds_split = ds_split.select(list(range(int(len(ds_split)*0.5))))
+        print(f"Sorting {split} split by audio length...")
+        ds_split = ds_split.map(add_length, batched=True, num_proc=4, batch_size=5000, input_columns=["start", "end"],
+                                cache_file_name=f"/media/bodza/Audio_Dataset/xcodec_raw_files/audio_len_{split}.arrow"
+                                )
+        # Getting the audio_len column and sorting it in memory
+        audio_lens = ds_split["audio_len"]
+        sorted_indices = np.argsort(audio_lens)
+        # Reversed order
+        sorted_indices = sorted_indices[::-1]
+        ds_split = ds_split.select(sorted_indices,
+                                   indices_cache_file_name=f"/media/bodza/Audio_Dataset/xcodec_raw_files/sorting_indices_{split}.json")
+        longest_audio = len(ds_split[0]["audio"]["array"])
+
+        # For testing take the last 32 samples
+        # ds_split = ds_split.select(range(len(ds_split)-32, len(ds_split)))
+        # For testing take the first 32 samples
+        # ds_split = ds_split.select(range(32))
         dataset = WaveDataset(ds_split, target_sampling_rate=target_sr)
         sampler = DistributedSampler(dataset, shuffle=False)
         dataloader = DataLoader(
@@ -265,19 +308,20 @@ if __name__ == "__main__":
             num_workers=args.num_workers,
             pin_memory=True,
             sampler=sampler,
-            collate_fn=pad_audio_batch,
-        )
+            collate_fn=lambda batch: pad_audio_batch(batch, longest_audio=longest_audio),        
+            )
+        
     
         max_length = args.max_length
         all_final_sequences = []  # List to accumulate tokenized sequences for this split
     
         print("Processing batches ...")
         st = time()
-        for batch in tqdm(dataloader, desc=f"Processing split {split}"):
-            wavs, feats, wav_paths, lengths, texts = batch
-            wavs = wavs.to(device)
+        with torch.inference_mode(), torch.amp.autocast(device_type="cuda"):
+            for batch in tqdm(dataloader, desc=f"Processing split {split}"):
+                wavs, feats, wav_paths, lengths, texts = batch
+                wavs = wavs.to(device)
             
-            with torch.no_grad():
                 # 1) Codec encoder to get speech representation
                 vq_emb = encoder(wavs)  # [batch, time//down, 1024]
                 vq_emb = vq_emb.transpose(1, 2)  # [batch, 1024, frames]
@@ -296,29 +340,29 @@ if __name__ == "__main__":
                 _, vq_code, _ = decoder(vq_emb, vq=True)
                 # Expected vq_code shape: [batch, 1, frames]
     
-            batch_size = vq_code.size(0)
-            for i in range(batch_size):
-                text = texts[i]
-                text_input = f"<|TEXT_UNDERSTANDING_START|>{text}<|TEXT_UNDERSTANDING_END|>"
-                text_ids = tokenizer.encode(text_input, add_special_tokens=False)
-                
-                # Remove extra channel; now speech_codes is 1D.
-                speech_codes = vq_code[i, 0, : lengths[i]]
-                speech_ids = (
-                    [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")]
-                    + [tokenizer.convert_tokens_to_ids(f"<|s_{int(code.item())}|>")
-                       for code in speech_codes.cpu()]
-                    + [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")]
-                )
-                
-                MAX_TEXT_SPACE = max_length - len(speech_ids)
-                if MAX_TEXT_SPACE < 0:
-                    continue
-                truncated_text = text_ids[:MAX_TEXT_SPACE]
-                final_sequence = (truncated_text + speech_ids +
-                                  [tokenizer.pad_token_id] * (max_length - len(truncated_text) - len(speech_ids)))
-                final_sequence = final_sequence[:max_length]
-                all_final_sequences.append(final_sequence)
+                batch_size = vq_code.size(0)
+                for i in range(batch_size):
+                    text = texts[i]
+                    text_input = f"<|TEXT_UNDERSTANDING_START|>{text}<|TEXT_UNDERSTANDING_END|>"
+                    text_ids = tokenizer.encode(text_input, add_special_tokens=False)
+                    
+                    # Remove extra channel; now speech_codes is 1D.
+                    speech_codes = vq_code[i, 0, : lengths[i]]
+                    speech_ids = (
+                        [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")]
+                        + [tokenizer.convert_tokens_to_ids(f"<|s_{int(code.item())}|>")
+                        for code in speech_codes.cpu()]
+                        + [tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")]
+                    )
+                    
+                    MAX_TEXT_SPACE = max_length - len(speech_ids)
+                    if MAX_TEXT_SPACE < 0:
+                        continue
+                    truncated_text = text_ids[:MAX_TEXT_SPACE]
+                    final_sequence = (truncated_text + speech_ids +
+                                    [tokenizer.pad_token_id] * (max_length - len(truncated_text) - len(speech_ids)))
+                    final_sequence = final_sequence[:max_length]
+                    all_final_sequences.append(final_sequence)
         et = time()
         print(f"Processing split '{split}' completed in {(et - st) / 60:.2f} mins")
     
@@ -331,4 +375,4 @@ if __name__ == "__main__":
             print(f"Saving tokenized sequences for split '{split}' to memmap...")
             save_tokenized_memmap(all_final_sequences, args.output_dir, split, max_length)
 
-# HF_HOME="/media/bodza/Audio_Dataset/hf_cache/" torchrun --nproc_per_node=2 original_translate_to_dataset_o3.py --dataset-dir="/media/bodza/Audio_Dataset/podcast_dataset/" --ckpt="/media/bodza/Audio_Dataset/xcodec_raw_files/xcodec2/ckpt/epoch=4-step=1400000.ckpt" --output-dir="/media/bodza/Audio_Dataset/xcodec_raw_files/output_original"
+    # HF_HOME="/media/bodza/Audio_Dataset/hf_cache/" torchrun --nproc_per_node=2 original_translate_to_dataset_o3.py --dataset-dir="/media/bodza/Audio_Dataset/podcast_dataset/" --ckpt="/media/bodza/Audio_Dataset/xcodec_raw_files/xcodec2/ckpt/epoch=4-step=1400000.ckpt" --output-dir="/media/bodza/Audio_Dataset/xcodec_raw_files/output_original"
