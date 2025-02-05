@@ -13,7 +13,7 @@ from transformers import (
     default_data_collator,
 )
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 import sys
 import transformers
 import wandb
@@ -55,27 +55,66 @@ class CustomTrainingArguments(TrainingArguments):
     lr_scheduler_type: str = field(default="cosine", metadata={"help": "The learning rate scheduler to use."})
   
 class TTSDataset(Dataset):
-    def __init__(self, data_path, split, tokenizer):
-        self.pad_token_id = tokenizer.pad_token_id   
+    def __init__(
+        self,
+        data_path,
+        split,
+        tokenizer,
+        ranks: Optional[List[int]] = None,
+        partials: Optional[List[int]] = None,
+    ):
+        self.pad_token_id = tokenizer.pad_token_id
         self.tokenizer = tokenizer
+        self.max_length = 2048
+        self.ignore_index = -100
 
-        # Look for chunked files.
-        chunk_idx = 0
-        self.chunks = []
-        self.cum_lengths = [0]  
-        
-        while True:
-            memmap_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}.memmap')
-            shape_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}_shape.npy')
-            if not os.path.exists(memmap_file) or not os.path.exists(shape_file):
-                break
+        # If the file naming follows the "rank/partial" convention then
+        # use that pattern. (For example, to use only files with partials 0
+        # and 1 from rank0 and rank1.)
+        if ranks is not None and partials is not None:
+            self.chunks = []
+            self.cum_lengths = [0]
+            for rank in sorted(ranks):
+                for partial in sorted(partials):
+                    memmap_file = os.path.join(
+                        data_path, f"{split}_rank{rank}_partial{partial}_input_ids.memmap"
+                    )
+                    shape_file = os.path.join(
+                        data_path,
+                        f"{split}_rank{rank}_partial{partial}_input_ids_shape.npy",
+                    )
+                    if os.path.exists(memmap_file) and os.path.exists(shape_file):
+                        shape = tuple(np.load(shape_file))
+                        chunk_memmap = np.memmap(
+                            memmap_file, dtype="int32", mode="r", shape=shape
+                        )
+                        self.chunks.append(chunk_memmap)
+                        self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
+            if len(self.chunks) == 0:
+                msg = (
+                    f"No memmap files found for pattern "
+                    f"{split}_rank*_partial*_input_ids.memmap in {data_path}"
+                )
+                raise ValueError(msg)
+            self.length = self.cum_lengths[-1]
+        else:
+            # Original sequential chunk reading.
+            chunk_idx = 0
+            self.chunks = []
+            self.cum_lengths = [0]
+            while True:
+                memmap_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}.memmap')
+                shape_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}_shape.npy')
+                if not os.path.exists(memmap_file) or not os.path.exists(shape_file):
+                    break
 
-            shape = tuple(np.load(shape_file))
-            # Open the memmap for the current chunk
-            chunk_memmap = np.memmap(memmap_file, dtype='int32', mode='r', shape=shape)
-            self.chunks.append(chunk_memmap)
-            self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
-            chunk_idx += 1
+                shape = tuple(np.load(shape_file))
+                chunk_memmap = np.memmap(
+                    memmap_file, dtype="int32", mode="r", shape=shape
+                )
+                self.chunks.append(chunk_memmap)
+                self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
+                chunk_idx += 1
 
         # If no chunks were found, fall back to a single file strategy.
         if len(self.chunks) == 0:
@@ -130,21 +169,26 @@ class TTSDataset(Dataset):
             return torch.cat([sequence, padding], dim=0)
 
     @classmethod
-    def create_truncated_dataset(cls, data_path, split, tokenizer,
-                                 num_samples=None, seed=None):
-        dataset = cls(data_path, split, tokenizer)
+    def create_truncated_dataset(
+        cls,
+        data_path,
+        split,
+        tokenizer,
+        num_samples=None,
+        seed=None,
+        ranks: Optional[List[int]] = None,
+        partials: Optional[List[int]] = None,
+    ):
+        dataset = cls(data_path, split, tokenizer, ranks=ranks, partials=partials)
         if num_samples is not None:
             # Set random seed for reproducibility.
             if seed is not None:
                 np.random.seed(seed)
-            # Shuffle indices from 0 to length-1.
             total_length = len(dataset)
             indices = np.random.permutation(total_length)
             selected_indices = indices[:num_samples]
-            # Instead of copying into a new memmap, we store the indices.
             dataset.selected_indices = sorted(selected_indices)
             dataset.use_selected = True
-            # We also update the length.
             dataset.length = len(dataset.selected_indices)
         else:
             dataset.use_selected = False
@@ -277,7 +321,6 @@ def main():
         model = AutoLigerKernelForCausalLM.from_pretrained(last_checkpoint, token=os.getenv("HF_TOKEN"))
     else:
         print("No checkpoint found, starting training from scratch")
-        # Load tokenizer from the initial model path
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.llm_model_name_or_path,
             model_max_length=training_args.model_max_length,
@@ -285,31 +328,30 @@ def main():
         )
         # tokenizer.pad_token = tokenizer.eos_token  # For LLaMa
         # check for llasa in modelargs to lowercase 
-        if "llasa" not in model_args.llm_model_name_or_path.lower():
-            print("======== [WARNING] =========")
-            print("Adding custom tokens for LLaMa model. Check that you are not using a already adjusted tokenizer!!")
-            tokenizer.pad_token_id = 128001
-            print(f"Original tokenizer vocabulary size: {len(tokenizer)}")
+        print("======== [WARNING] =========")
+        print("Adding custom tokens for LLaMa model. Check that you are not using a already adjusted tokenizer!!")
+        tokenizer.pad_token_id = 128001
+        print(f"Original tokenizer vocabulary size: {len(tokenizer)}")
 
-            Start_End_tokens = [
-                '<|TEXT_GENERATION_START|>',
-                '<|TEXT_GENERATION_END|>',
-                '<|TEXT_UNDERSTANDING_START|>',
-                '<|TEXT_UNDERSTANDING_END|>',
-                '<|SPEECH_GENERATION_START|>',
-                '<|SPEECH_GENERATION_END|>',
-                '<|SPEECH_UNDERSTANDING_START|>',
-                '<|SPEECH_UNDERSTANDING_END|>'
-            ]
+        Start_End_tokens = [
+            '<|TEXT_GENERATION_START|>',
+            '<|TEXT_GENERATION_END|>',
+            '<|TEXT_UNDERSTANDING_START|>',
+            '<|TEXT_UNDERSTANDING_END|>',
+            '<|SPEECH_GENERATION_START|>',
+            '<|SPEECH_GENERATION_END|>',
+            '<|SPEECH_UNDERSTANDING_START|>',
+            '<|SPEECH_UNDERSTANDING_END|>'
+        ]
 
-    
-            new_speech_tokens = [f'<|s_{i}|>' for i in range(65536)]   
-            all_new_tokens = Start_End_tokens + new_speech_tokens
-            num_added_tokens = tokenizer.add_tokens(all_new_tokens)
-            print(f"Added {num_added_tokens} speech tokens to the tokenizer.")
 
- 
-            tokenizer.save_pretrained(training_args.output_dir)
+        new_speech_tokens = [f'<|s_{i}|>' for i in range(65536)]   
+        all_new_tokens = Start_End_tokens + new_speech_tokens
+        num_added_tokens = tokenizer.add_tokens(all_new_tokens)
+        print(f"Added {num_added_tokens} speech tokens to the tokenizer.")
+
+
+        tokenizer.save_pretrained(training_args.output_dir)
  
         # model = AutoModelForCausalLM.from_pretrained(
         #     model_args.llm_model_name_or_path,
@@ -334,19 +376,24 @@ def main():
  
     train_dataset = TTSDataset(
         data_path=data_args.data_path,
-        split='train',
-        tokenizer=tokenizer
+        split="train",
+        tokenizer=tokenizer,
+        ranks=[0, 1],
+        partials=[0, 1],
     )
     print(f"Train dataset length: {len(train_dataset)}")
     train_dataset[0]
 
-    if os.path.exists(os.path.join(data_args.data_path, 'test_input_ids.memmap')):
+    # For evaluation, adjust as needed.
+    if os.path.exists(os.path.join(data_args.data_path, "test_input_ids.memmap")):
         eval_dataset = TTSDataset.create_truncated_dataset(
             data_path=data_args.data_path,
-            split='test',
+            split="test",
             tokenizer=tokenizer,
-            num_samples=12,  # Number of samples you want to keep
-            seed=42  # For reproducibility
+            num_samples=12,
+            seed=42,
+            ranks=[0, 1],
+            partials=[0, 1],
         )
     else:
         eval_dataset = None
