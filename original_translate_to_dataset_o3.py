@@ -102,12 +102,19 @@ class WaveDataset(Dataset):
 ###########################
 # Saving Tokenized Output #
 ###########################
-
-def save_tokenized_memmap(all_sequences: List[List[int]], output_dir: str, 
-                          split: str, max_length: int):
+def save_tokenized_memmap(
+    all_sequences: List[List[int]], output_dir: str, split: str,
+    rank: int, batch_id: int, max_length: int
+):
     os.makedirs(output_dir, exist_ok=True)
-    memmap_path = os.path.join(output_dir, f"{split}_input_ids.memmap")
-    shape_path = os.path.join(output_dir, f"{split}_input_ids_shape.npy")
+    memmap_path = os.path.join(
+        output_dir,
+        f"{split}_rank{rank}_partial{batch_id}_input_ids.memmap"
+    )
+    shape_path = os.path.join(
+        output_dir,
+        f"{split}_rank{rank}_partial{batch_id}_input_ids_shape.npy"
+    )
     
     all_sequences = np.array(all_sequences, dtype=np.int32)
     num_sequences = all_sequences.shape[0]
@@ -300,7 +307,7 @@ if __name__ == "__main__":
         # For testing take the last 32 samples
         # ds_split = ds_split.select(range(len(ds_split)-32, len(ds_split)))
         # For testing take the first 32 samples
-        # ds_split = ds_split.select(range(32))
+        # ds_split = ds_split.select(range(64))
         dataset = WaveDataset(ds_split, target_sampling_rate=target_sr)
         sampler = DistributedSampler(dataset, shuffle=False)
         dataloader = DataLoader(
@@ -315,12 +322,18 @@ if __name__ == "__main__":
         
     
         max_length = args.max_length
-        all_final_sequences = []  # List to accumulate tokenized sequences for this split
-    
+        all_final_sequences = [] 
+        
+        # Since we are not only GPU poor but also memory poor, we will save and clear the sequences periodically.
+        save_interval = 5000  # 5000
+        batch_counter = 0
+        partial_counter = 0
+        
         print("Processing batches ...")
         st = time()
         with torch.inference_mode(), torch.amp.autocast(device_type="cuda"):
             for batch in tqdm(dataloader, desc=f"Processing split {split}"):
+                batch_counter += 1
                 model_start_time = time()
                 wavs, feats, wav_paths, lengths, texts = batch
                 wavs = wavs.to(device)
@@ -343,7 +356,6 @@ if __name__ == "__main__":
                 _, vq_code, _ = decoder(vq_emb, vq=True)
                 # Expected vq_code shape: [batch, 1, frames]
                 batch_size = vq_code.size(0)
-                model_time = time() - model_start_time
                 vq_code = vq_code.to(device='cpu') 
 
                 text_inputs = [f"<|TEXT_UNDERSTANDING_START|>{text}<|TEXT_UNDERSTANDING_END|>" for text in texts]
@@ -355,7 +367,7 @@ if __name__ == "__main__":
                 for i in range(batch_size):
                     text_ids = batched_text_ids[i]
                     speech_codes_tensor = vq_code[i, 0, : lengths[i]]
-                    speech_codes = speech_codes_tensor.cpu().tolist()
+                    speech_codes = speech_codes_tensor.tolist()
                     speech_token_strs = [f"<|s_{int(code)}|>" for code in speech_codes]
                     speech_ids = (
                         [SPEECH_GEN_START_ID]
@@ -371,17 +383,23 @@ if __name__ == "__main__":
                                     [tokenizer.pad_token_id] * (max_length - len(truncated_text) - len(speech_ids)))
                     final_sequence = final_sequence[:max_length]
                     all_final_sequences.append(final_sequence)
+                
+                # Save and clear periodically to release memory.
+                if batch_counter % save_interval == 0:
+                    save_tokenized_memmap(all_final_sequences, args.output_dir, split, local_rank, partial_counter, max_length )
+                    all_final_sequences.clear()  
+                    partial_counter += 1
 
+            if all_final_sequences:
+                save_tokenized_memmap(
+                    all_final_sequences,
+                    args.output_dir,
+                    split,
+                    local_rank,
+                    partial_counter,
+                    max_length
+                )
+                all_final_sequences.clear()
         et = time()
         print(f"Processing split '{split}' completed in {(et - st) / 60:.2f} mins")
-    
-        # Gather sequences from all processes using the Gloo group
-        if dist.is_initialized():
-            all_final_sequences = gather_results(all_final_sequences)
-    
-        # Only rank 0 writes the final memmap for this split.
-        if local_rank == 0:
-            print(f"Saving tokenized sequences for split '{split}' to memmap...")
-            save_tokenized_memmap(all_final_sequences, args.output_dir, split, max_length)
-
     # HF_HOME="/media/bodza/Audio_Dataset/hf_cache/" torchrun --nproc_per_node=2 original_translate_to_dataset_o3.py --dataset-dir="/media/bodza/Audio_Dataset/podcast_dataset/" --ckpt="/media/bodza/Audio_Dataset/xcodec_raw_files/xcodec2/ckpt/epoch=4-step=1400000.ckpt" --output-dir="/media/bodza/Audio_Dataset/xcodec_raw_files/output_original"
