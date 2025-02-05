@@ -22,8 +22,10 @@ import numpy as np
 import random
 from datasets import load_dataset
 from functools import partial
- 
- 
+import bitsandbytes as bnb
+from transformers.trainer_pt_utils import get_parameter_names
+from liger_kernel.transformers import AutoLigerKernelForCausalLM
+
 @dataclass
 class ModelArguments:
     llm_model_name_or_path: Optional[str] = field(default="meta-llama/Llama-3.2-1B-Instruct")
@@ -54,16 +56,40 @@ class CustomTrainingArguments(TrainingArguments):
   
 class TTSDataset(Dataset):
     def __init__(self, data_path, split, tokenizer):
- 
-        memmap_path = os.path.join(data_path, f'{split}_input_ids.memmap')
-        shape_path = os.path.join(data_path, f'{split}_input_ids_shape.npy')
-
-        self.input_ids = np.memmap(memmap_path, dtype='int32', mode='r', shape=tuple(np.load(shape_path)))
-        self.length = self.input_ids.shape[0]
         self.pad_token_id = tokenizer.pad_token_id   
         self.tokenizer = tokenizer
 
-   
+        # Look for chunked files.
+        chunk_idx = 0
+        self.chunks = []
+        self.cum_lengths = [0]  
+        
+        while True:
+            memmap_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}.memmap')
+            shape_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}_shape.npy')
+            if not os.path.exists(memmap_file) or not os.path.exists(shape_file):
+                break
+
+            shape = tuple(np.load(shape_file))
+            # Open the memmap for the current chunk
+            chunk_memmap = np.memmap(memmap_file, dtype='int32', mode='r', shape=shape)
+            self.chunks.append(chunk_memmap)
+            self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
+            chunk_idx += 1
+
+        # If no chunks were found, fall back to a single file strategy.
+        if len(self.chunks) == 0:
+            memmap_file = os.path.join(data_path, f'{split}_input_ids.memmap')
+            shape_file = os.path.join(data_path, f'{split}_input_ids_shape.npy')
+            shape = tuple(np.load(shape_file))
+            self.single_memmap = np.memmap(memmap_file, dtype='int32', mode='r', shape=shape)
+            self.length = shape[0]
+            self.chunks = [self.single_memmap]
+            self.cum_lengths = [0, self.length]
+        else:
+            self.length = self.cum_lengths[-1]
+
+        # These IDs remain the same.
         self.speech_generation_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_START|>')
         self.speech_generation_end_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_END|>')
         self.text_generation_start_id = tokenizer.convert_tokens_to_ids('<|TEXT_GENERATION_START|>')
@@ -79,6 +105,19 @@ class TTSDataset(Dataset):
     def __len__(self):
         return self.length
 
+    def get_chunk_and_local_index(self, idx):
+        """
+        Given a global sample index, determine which chunk this sample lies in,
+        and return the chunk (memmap array) and the local index.
+        """
+        # Binary search could be used here, but given the small number of chunks, a
+        # linear iteration is sufficient.
+        for i in range(1, len(self.cum_lengths)):
+            if idx < self.cum_lengths[i]:
+                local_idx = idx - self.cum_lengths[i - 1]
+                return self.chunks[i - 1], local_idx
+        raise IndexError("Index out of bounds")
+
     def replace_tagged_token(self, token_list, target_token, new_sequence):
         idx = token_list.index(target_token)
         return token_list[:idx] + list(new_sequence) + token_list[idx+1:]
@@ -90,10 +129,38 @@ class TTSDataset(Dataset):
             padding = torch.full((max_length - len(sequence),), value, dtype=sequence.dtype)
             return torch.cat([sequence, padding], dim=0)
 
-    def __getitem__(self, idx):
-        input_ids = torch.tensor(self.input_ids[idx], dtype=torch.long)
+    @classmethod
+    def create_truncated_dataset(cls, data_path, split, tokenizer,
+                                 num_samples=None, seed=None):
+        dataset = cls(data_path, split, tokenizer)
+        if num_samples is not None:
+            # Set random seed for reproducibility.
+            if seed is not None:
+                np.random.seed(seed)
+            # Shuffle indices from 0 to length-1.
+            total_length = len(dataset)
+            indices = np.random.permutation(total_length)
+            selected_indices = indices[:num_samples]
+            # Instead of copying into a new memmap, we store the indices.
+            dataset.selected_indices = sorted(selected_indices)
+            dataset.use_selected = True
+            # We also update the length.
+            dataset.length = len(dataset.selected_indices)
+        else:
+            dataset.use_selected = False
 
- 
+        return dataset
+
+    def __getitem__(self, idx):
+        # If using a truncated dataset, map idx to the original index.
+        if hasattr(self, "use_selected") and self.use_selected:
+            global_idx = self.selected_indices[idx]
+        else:
+            global_idx = idx
+
+        chunk, local_idx = self.get_chunk_and_local_index(global_idx)
+        input_ids_np = chunk[local_idx]
+        input_ids = torch.tensor(input_ids_np, dtype=torch.long)
         labels = torch.full_like(input_ids, self.ignore_index)
 
  
@@ -127,10 +194,9 @@ class TTSDataset(Dataset):
         labels = torch.full_like(input_ids, self.ignore_index)
 
         try:
- 
-            speech_gen_idx_in_input = (input_ids == self.speech_generation_start_id).nonzero(as_tuple=True)[0].item()
-    
-            
+            speech_gen_idx_in_input = (
+                input_ids == self.speech_generation_start_id
+            ).nonzero(as_tuple=True)[0].item()
             labels[speech_gen_idx_in_input:] = input_ids[speech_gen_idx_in_input:]
         except Exception as e:
             print(f"maybe Error in speech_gen_idx_in_input: {e}")
@@ -205,9 +271,10 @@ def main():
 
     if last_checkpoint is not None:
         print(f"Loading model and tokenizer from checkpoint {last_checkpoint}")
-        tokenizer = AutoTokenizer.from_pretrained(last_checkpoint)
+        tokenizer = AutoTokenizer.from_pretrained(last_checkpoint, token=os.getenv("HF_TOKEN"))
         tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(last_checkpoint)
+        # model = AutoModelForCausalLM.from_pretrained(last_checkpoint)
+        model = AutoLigerKernelForCausalLM.from_pretrained(last_checkpoint, token=os.getenv("HF_TOKEN"))
     else:
         print("No checkpoint found, starting training from scratch")
         # Load tokenizer from the initial model path
@@ -216,35 +283,43 @@ def main():
             model_max_length=training_args.model_max_length,
             padding_side="right",
         )
-        tokenizer.pad_token = tokenizer.eos_token  # For LLaMa
-        original_vocab_size = len(tokenizer)
-        print(f"Original tokenizer vocabulary size: {len(tokenizer)}")
+        # tokenizer.pad_token = tokenizer.eos_token  # For LLaMa
+        # check for llasa in modelargs to lowercase 
+        if "llasa" not in model_args.llm_model_name_or_path.lower():
+            print("======== [WARNING] =========")
+            print("Adding custom tokens for LLaMa model. Check that you are not using a already adjusted tokenizer!!")
+            tokenizer.pad_token_id = 128001
+            print(f"Original tokenizer vocabulary size: {len(tokenizer)}")
 
-        Start_End_tokens = [
-            '<|TEXT_GENERATION_START|>',
-            '<|TEXT_GENERATION_END|>',
-            '<|TEXT_UNDERSTANDING_START|>',
-            '<|TEXT_UNDERSTANDING_END|>',
-            '<|SPEECH_GENERATION_START|>',
-            '<|SPEECH_GENERATION_END|>',
-            '<|SPEECH_UNDERSTANDING_START|>',
-            '<|SPEECH_UNDERSTANDING_END|>'
-        ]
+            Start_End_tokens = [
+                '<|TEXT_GENERATION_START|>',
+                '<|TEXT_GENERATION_END|>',
+                '<|TEXT_UNDERSTANDING_START|>',
+                '<|TEXT_UNDERSTANDING_END|>',
+                '<|SPEECH_GENERATION_START|>',
+                '<|SPEECH_GENERATION_END|>',
+                '<|SPEECH_UNDERSTANDING_START|>',
+                '<|SPEECH_UNDERSTANDING_END|>'
+            ]
+
+    
+            new_speech_tokens = [f'<|s_{i}|>' for i in range(65536)]   
+            all_new_tokens = Start_End_tokens + new_speech_tokens
+            num_added_tokens = tokenizer.add_tokens(all_new_tokens)
+            print(f"Added {num_added_tokens} speech tokens to the tokenizer.")
 
  
-        new_speech_tokens = [f'<|s_{i}|>' for i in range(65536)]   
-        all_new_tokens = Start_End_tokens + new_speech_tokens
-        num_added_tokens = tokenizer.add_tokens(all_new_tokens)
-        print(f"Added {num_added_tokens} speech tokens to the tokenizer.")
-
+            tokenizer.save_pretrained(training_args.output_dir)
  
-        tokenizer.save_pretrained(training_args.output_dir)
- 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_args.llm_model_name_or_path,
-            torch_dtype='auto',
-            cache_dir=model_args.cache_dir,
-        )
+        # model = AutoModelForCausalLM.from_pretrained(
+        #     model_args.llm_model_name_or_path,
+        #     torch_dtype='auto',
+        #     cache_dir=model_args.cache_dir,
+        # )
+        model = AutoLigerKernelForCausalLM.from_pretrained(model_args.llm_model_name_or_path, 
+                                                           cache_dir=model_args.cache_dir, 
+                                                           torch_dtype='auto'
+                                                           )
 
         # Adjust the embedding layer and lm_head
         model.resize_token_embeddings(len(tokenizer))
@@ -262,16 +337,60 @@ def main():
         split='train',
         tokenizer=tokenizer
     )
+    print(f"Train dataset length: {len(train_dataset)}")
     train_dataset[0]
-    eval_dataset = TTSDataset(
-        data_path=data_args.data_path,
-        split='val',
-        tokenizer=tokenizer
-    ) if os.path.exists(os.path.join(data_args.data_path, 'val_input_ids.memmap')) else None
+
+    if os.path.exists(os.path.join(data_args.data_path, 'test_input_ids.memmap')):
+        eval_dataset = TTSDataset.create_truncated_dataset(
+            data_path=data_args.data_path,
+            split='test',
+            tokenizer=tokenizer,
+            num_samples=12,  # Number of samples you want to keep
+            seed=42  # For reproducibility
+        )
+    else:
+        eval_dataset = None
+
  
     data_collator = default_data_collator
 
-     
+
+
+    ##########################################
+    decay_parameters = get_parameter_names(model, [nn.LayerNorm])
+    decay_parameters = [name for name in decay_parameters if "bias" not in name]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if n in decay_parameters],
+            "weight_decay": training_args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if n not in decay_parameters],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    optimizer_kwargs = {
+        "betas": (training_args.adam_beta1, training_args.adam_beta2),
+        "eps": training_args.adam_epsilon,
+    }
+
+    optimizer_kwargs["lr"] = training_args.learning_rate
+
+    adam_bnb_optim = bnb.optim.Adam8bit(
+        optimizer_grouped_parameters,
+        betas=(training_args.adam_beta1, training_args.adam_beta2),
+        eps=training_args.adam_epsilon,
+        lr=training_args.learning_rate,
+    )
+    training_args.optim = (adam_bnb_optim, None)
+    training_args.optimizers = (adam_bnb_optim, None)
+    ##### Optimizer #####
+
+    print("Training Parameters:")
+    print(training_args)
+    print("===========")
+
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -279,6 +398,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        optimizers=(adam_bnb_optim, None),
     )
     if is_main_process:
         trainer.add_callback(transformers.integrations.WandbCallback())
