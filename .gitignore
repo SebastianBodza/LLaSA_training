@@ -1,0 +1,8 @@
+.env
+wandb
+__pycache__
+*.wav
+Archiv/*
+modal/
+old_configs
+tests
